@@ -5,6 +5,10 @@ defmodule PGZeroTest.Support.IdleGenserver do
     GenServer.start_link(__MODULE__, [])
   end
 
+  def start() do
+    GenServer.start(__MODULE__, [])
+  end
+
   def init(_) do
     {:ok, []}
   end

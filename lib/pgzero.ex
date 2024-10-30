@@ -36,12 +36,26 @@ defmodule PGZero do
               remotes: %{}
   end
 
-  def start_link(scope \\ __MODULE__) do
+  def start_link([scope]) do
     GenServer.start_link(__MODULE__, [scope], name: scope)
   end
 
+  def start_link([]) do
+    scope = __MODULE__
+    GenServer.start_link(__MODULE__, [scope], name: scope)
+  end
+
+  def start([scope]) do
+    GenServer.start(__MODULE__, [scope], name: scope)
+  end
+
+  def start([]) do
+    scope = __MODULE__
+    GenServer.start(__MODULE__, [scope], name: scope)
+  end
+
   @impl true
-  def init(scope) do
+  def init([scope]) do
     :net_kernel.monitor_nodes(true)
     # subscribes me to :nodeup and :nodedown message, but we only need :nodeup.
     {:ok, %ScopeState{scope: scope}}
@@ -69,6 +83,10 @@ defmodule PGZero do
     GenServer.call(scope, {:local_members, group})
   end
 
+  def state(scope \\ __MODULE__) do
+    GenServer.call(scope, :state)
+  end
+
   @impl true
   @doc """
   one pid joining
@@ -86,8 +104,8 @@ defmodule PGZero do
       when is_pid(pid) do
     new_pids_local =
       case Map.has_key?(pids_local, pid) do
-        true -> Map.update!(pids_local, pid, &[pid | &1])
-        false -> Map.put(pids_local, pid, Process.monitor(pid))
+        true -> Map.update!(pids_local, pid, fn {ref, groups} -> {ref, [group | groups]} end)
+        false -> Map.put(pids_local, pid, {Process.monitor(pid), [group]})
       end
 
     new_groups =
@@ -108,45 +126,17 @@ defmodule PGZero do
      %{state | pids_local: new_pids_local, groups: new_groups, groups_local: new_groups_local}}
   end
 
-  # One pid leaving
+  # One pid leaving; logic broken out into handle_leave so we can reuse it for a local pid going down.
 
   def handle_call(
         {:leave, pid, group},
         _from,
-        state = %ScopeState{
-          groups: groups,
-          groups_local: groups_local,
-          pids_local: pids_local,
-          remotes: remotes
-        }
+        state
       )
       when is_pid(pid) do
-    ref = pids_local[pid]
+    new_state = handle_local_leave(pid, group, state)
 
-    Process.demonitor(ref, [:flush])
-
-    new_pids_local = Map.delete(pids_local, pid)
-
-    new_groups =
-      case Map.get(groups, group) do
-        [_pid] -> Map.delete(groups, group)
-        pids -> Map.put(groups, group, List.delete(pids, pid))
-      end
-
-    new_groups_local =
-      case Map.get(groups_local, group) do
-        [_pid] -> Map.delete(groups_local, group)
-        pids -> Map.put(groups_local, group, List.delete(pids, pid))
-      end
-
-    # Somewhere here we send sync messages.
-    Enum.map(
-      Map.keys(remotes),
-      fn remote -> send(remote, {:leave, pid, group}) end
-    )
-
-    {:reply, :ok,
-     %{state | pids_local: new_pids_local, groups: new_groups, groups_local: new_groups_local}}
+    {:reply, :ok, new_state}
   end
 
   def handle_call({:members, group}, _from, state = %ScopeState{groups: groups}) do
@@ -157,29 +147,38 @@ defmodule PGZero do
     {:reply, groups_local[group], state}
   end
 
+  def handle_call(:state, _from, state) do
+    {:reply, state, state}
+  end
+
   # nodes joining, send discover message!
   @impl true
   def handle_info({:nodeup, node}, %{scope: scope} = state) do
-    send({node, scope}, {:discover, self()})
+    send({scope, node}, {:discover, self()})
+    {:noreply, state}
+  end
+
+  def handle_info({:nodedown, _node}, state) do
+    # don't worry about this one
     {:noreply, state}
   end
 
   # These get sent whenever a new node comes up.
+
   def handle_info(
         {:discover, pid},
         state = %ScopeState{groups_local: groups_local, remotes: remotes}
       ) do
-    # sync goes here! Send the person we just got messaged by all the local pids we have.
     send(pid, {:sync, node(), groups_local})
 
-    new_state =
+    new_remotes =
       case pid in Map.keys(remotes) do
         # do we know them?
         true -> state
-        false -> %{state | remotes: %{remotes | pid => Process.monitor(pid)}}
+        false -> Map.put(remotes, pid, Process.monitor(pid))
       end
 
-    {:noreply, new_state}
+    {:noreply, %{state | remotes: new_remotes}}
   end
 
   def handle_info({:join, pid, group}, state = %ScopeState{groups: groups}) do
@@ -228,9 +227,105 @@ defmodule PGZero do
     {:noreply, %{state | groups: new_groups}}
   end
 
-  # @impl true
-  # def handle_info({'DOWN', mref, _, pid, _}, state) do
-  # end
+  @impl true
+  # handle a local pid going down
+  def handle_info({:DOWN, _mref, _, pid, _}, state = %ScopeState{pids_local: pids_local})
+      when node(pid) == node() do
+    # We can do exactly the same thing as if the pid left all of its groups
+    {ref, groups} = pids_local[pid]
+    Process.demonitor(ref)
+
+    new_state =
+      groups
+      |> Enum.reduce(
+        state,
+        fn group, state ->
+          handle_local_leave(pid, group, state)
+        end
+      )
+
+    {:noreply, new_state}
+  end
+
+  # Handle a remote node going down.
+  def handle_info({:DOWN, mref, pid, _}, state = %ScopeState{groups: groups, remotes: remotes}) do
+    # PG stashes a complete copy of groups_local alongside the monitor refs in its remotes dictionary,
+    # so this step can be a lot more efficient for it, in case nodes are falling off the planet frequently.
+    # We'll just run through groups and pids and leave them.
+
+    remote_node = node(pid)
+    Process.demonitor(mref)
+
+    group_pid_list =
+      for group <- Map.keys(groups),
+          pid <- groups[group],
+          node(pid) == remote_node,
+          do: {group, pid}
+
+    new_state =
+      group_pid_list
+      |> Enum.reduce(
+        state,
+        fn {group, pid}, state ->
+          handle_remote_leave(pid, group, state)
+        end
+      )
+
+    {:noreply, %{new_state | remotes: Map.delete(remotes, pid)}}
+  end
+
+  defp handle_local_leave(
+         pid,
+         group,
+         state = %ScopeState{
+           groups: groups,
+           groups_local: groups_local,
+           pids_local: pids_local,
+           remotes: remotes
+         }
+       ) do
+    {ref, pid_groups} = pids_local[pid]
+
+    new_pids_local =
+      case pid_groups do
+        [_] ->
+          Process.demonitor(ref)
+          Map.delete(pids_local, pid)
+
+        pid_groups ->
+          Map.put(pids_local, pid, {ref, List.delete(pid_groups, group)})
+      end
+
+    new_groups =
+      case Map.get(groups, group) do
+        [_pid] -> Map.delete(groups, group)
+        pids -> Map.put(groups, group, List.delete(pids, pid))
+      end
+
+    new_groups_local =
+      case Map.get(groups_local, group) do
+        [_pid] -> Map.delete(groups_local, group)
+        pids -> Map.put(groups_local, group, List.delete(pids, pid))
+      end
+
+    # Somewhere here we send sync messages.
+    Enum.map(
+      Map.keys(remotes),
+      fn remote -> send(remote, {:leave, pid, group}) end
+    )
+
+    %{state | pids_local: new_pids_local, groups: new_groups, groups_local: new_groups_local}
+  end
+
+  defp handle_remote_leave(pid, group, state = %ScopeState{groups: groups}) do
+    new_groups =
+      case Map.get(groups, group) do
+        [_pid] -> Map.delete(groups, group)
+        pids -> Map.put(groups, group, List.delete(pids, pid))
+      end
+
+    %{state | groups: new_groups}
+  end
 
   defp ensure_all_local([]), do: :ok
 

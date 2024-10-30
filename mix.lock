@@ -1,0 +1,4 @@
+%{
+  "global_flags": {:hex, :global_flags, "1.0.0", "ee6b864979a1fb38d1fbc67838565644baf632212bce864adca21042df036433", [:rebar3], [], "hexpm", "85d944cecd0f8f96b20ce70b5b16ebccedfcd25e744376b131e89ce61ba93176"},
+  "local_cluster": {:hex, :local_cluster, "2.1.0", "1c847d69a927ef5a62db13236f93146e8a42377a9c9a5bb4cac3372cba69d683", [:mix], [{:global_flags, "~> 1.0", [hex: :global_flags, repo: "hexpm", optional: false]}], "hexpm", "dc1c3abb6fef00198dd53c855b39ea80c55b3a8059d8d9f17d50da46b1e3b858"},
+}
