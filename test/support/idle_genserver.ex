@@ -2,7 +2,7 @@ defmodule PGZeroTest.Support.IdleGenserver do
   use GenServer
 
   def start_link() do
-    GenServer.start_link(__MODULE__, [])
+    GenServer.start_link(__MODULE__, [], name: __MODULE__)
   end
 
   def start() do

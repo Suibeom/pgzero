@@ -21,7 +21,7 @@ defmodule PGZero.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      mod: {PGZeroAgent, []},
+      # mod: {PGZeroAgent, []},
       extra_applications: [:logger]
     ]
   end
