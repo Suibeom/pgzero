@@ -88,12 +88,24 @@ defmodule PGZero do
     GenServer.call(scope, {:monitor, group})
   end
 
+  def demonitor(mref, group, scope \\ __MODULE__) do
+    GenServer.call(scope, {:demonitor, mref, group})
+  end
+
   def monitor_scope(scope \\ __MODULE__) do
     GenServer.call(scope, :monitor_scope)
   end
 
-  def state(scope \\ __MODULE__) do
-    GenServer.call(scope, :state)
+  def demonitor_scope(mref, scope \\ __MODULE__) do
+    GenServer.call(scope, {:demonitor_scope, mref})
+  end
+
+  def which_groups(scope \\ __MODULE__) do
+    GenServer.call(scope, :which_groups)
+  end
+
+  def which_local_groups(scope \\ __MODULE__) do
+    GenServer.call(scope, :which_local_groups)
   end
 
   @impl true
@@ -101,7 +113,7 @@ defmodule PGZero do
   one pid joining
   """
   def handle_call(
-        action = {:join, pid, group},
+        event = {:join, pid, group},
         _from,
         state = %ScopeState{
           groups: groups,
@@ -131,7 +143,7 @@ defmodule PGZero do
       fn remote -> send(remote, {:join, pid, group}) end
     )
 
-    notify_watchers(action, state)
+    notify_watchers(event, state)
 
     {:reply, :ok,
      %{state | pids_local: new_pids_local, groups: new_groups, groups_local: new_groups_local}}
@@ -140,28 +152,38 @@ defmodule PGZero do
   # One pid leaving; logic broken out into handle_leave so we can reuse it for a local pid going down.
 
   def handle_call(
-        action = {:leave, pid, group},
+        event = {:leave, pid, group},
         _from,
         state
       )
       when is_pid(pid) do
     new_state = handle_local_leave(pid, group, state)
 
-    notify_watchers(action, state)
+    notify_watchers(event, state)
 
     {:reply, :ok, new_state}
   end
 
   def handle_call({:members, group}, _from, state = %ScopeState{groups: groups}) do
-    {:reply, groups[group], state}
+    {:reply, Map.get(groups, group, []), state}
   end
 
   def handle_call({:local_members, group}, _from, state = %ScopeState{groups_local: groups_local}) do
-    {:reply, groups_local[group], state}
+    {:reply, Map.get(groups_local, group, []), state}
   end
 
   def handle_call(:monitor_scope, {pid, _}, state = %ScopeState{scope_monitors: scope_monitors}) do
-    {:reply, :ok, %{state | scope_monitors: Map.put(scope_monitors, Process.monitor(pid), pid)}}
+    mref = Process.monitor(pid)
+    {:reply, {:ok, mref}, %{state | scope_monitors: Map.put(scope_monitors, mref, pid)}}
+  end
+
+  def handle_call(
+        {:demonitor_scope, mref},
+        {pid, _},
+        state = %ScopeState{scope_monitors: scope_monitors}
+      ) do
+    Process.demonitor(mref)
+    {:reply, {:ok, mref}, %{state | scope_monitors: Map.delete(scope_monitors, mref)}}
   end
 
   def handle_call(
@@ -169,17 +191,34 @@ defmodule PGZero do
         {pid, _},
         state = %ScopeState{group_monitors: group_monitors}
       ) do
+    mref = Process.monitor(pid)
+
     new_group_monitors =
       case group_monitors[group] do
-        nil -> Map.put(group_monitors, group, %{Process.monitor(pid) => pid})
-        map -> Map.update!(group_monitors, group, &Map.put(&1, Process.monitor(pid), pid))
+        nil -> Map.put(group_monitors, group, %{mref => pid})
+        map -> Map.update!(group_monitors, group, &Map.put(&1, mref, pid))
       end
+
+    {:reply, {:ok, mref}, %{state | group_monitors: new_group_monitors}}
+  end
+
+  def handle_call(
+        {:demonitor, mref, group},
+        {pid, _},
+        state = %ScopeState{group_monitors: group_monitors}
+      ) do
+    Process.demonitor(mref)
+    new_group_monitors = %{group_monitors | group => Map.delete(group_monitors[group], mref)}
 
     {:reply, :ok, %{state | group_monitors: new_group_monitors}}
   end
 
-  def handle_call(:state, _from, state) do
-    {:reply, state, state}
+  def handle_call(:which_groups, _from, state = %ScopeState{groups: groups}) do
+    {:reply, Map.keys(groups), state}
+  end
+
+  def handle_call(:which_local_groups, _from, state = %ScopeState{groups_local: groups_local}) do
+    {:reply, Map.keys(groups_local), state}
   end
 
   # nodes joining, send discover message!
@@ -212,24 +251,24 @@ defmodule PGZero do
     {:noreply, %{state | remotes: new_remotes}}
   end
 
-  def handle_info(action = {:join, pid, group}, state = %ScopeState{groups: groups}) do
+  def handle_info(event = {:join, pid, group}, state = %ScopeState{groups: groups}) do
     new_groups =
       groups
       |> Map.update(group, [pid], &[pid | &1])
 
-    notify_watchers(action, state)
+    notify_watchers(event, state)
 
     {:noreply, %{state | groups: new_groups}}
   end
 
-  def handle_info(action = {:leave, pid, group}, state = %ScopeState{groups: groups}) do
+  def handle_info(event = {:leave, pid, group}, state = %ScopeState{groups: groups}) do
     new_groups =
       case Map.get(groups, group) do
         [_pid] -> Map.delete(groups, group)
         pids -> Map.put(groups, group, List.delete(pids, pid))
       end
 
-    notify_watchers(action, state)
+    notify_watchers(event, state)
 
     {:noreply, %{state | groups: new_groups}}
   end
@@ -263,21 +302,44 @@ defmodule PGZero do
   end
 
   @impl true
-  # handle a local pid going down.
-  def handle_info({:DOWN, _mref, _, pid, _}, state = %ScopeState{pids_local: pids_local})
+  # handle a local pid going down. N.B., we get one of these for each monitor, not each pid!
+  def handle_info(
+        {:DOWN, mref, _, pid, _},
+        state = %ScopeState{
+          pids_local: pids_local,
+          group_monitors: group_monitors,
+          scope_monitors: scope_monitors
+        }
+      )
       when node(pid) == node() do
-    # We can do exactly the same thing as if the pid left all of its groups
-    {ref, groups} = pids_local[pid]
-    Process.demonitor(ref)
+    Process.demonitor(mref)
 
     new_state =
-      groups
-      |> Enum.reduce(
-        state,
-        fn group, state ->
-          handle_local_leave(pid, group, state)
-        end
-      )
+      case {pids_local[pid], scope_monitors[mref]} do
+        # Was this monitor for a pid in a process group?
+        {{^mref, groups}, _} ->
+          groups
+          |> Enum.reduce(
+            state,
+            fn group, state ->
+              handle_local_leave(pid, group, state)
+            end
+          )
+
+        # Or a scope-wide monitor?
+        {_, {^mref, _}} ->
+          %{state | scope_monitors: Map.delete(scope_monitors, mref)}
+
+        # Or was it a group monitor?
+        _ ->
+          new_group_monitors =
+            Enum.map(group_monitors, fn {group, monitor_map} ->
+              {group, Map.delete(monitor_map, mref)}
+            end)
+            |> Enum.into(%{})
+
+          %{state | group_monitors: new_group_monitors}
+      end
 
     {:noreply, new_state}
   end
@@ -319,16 +381,16 @@ defmodule PGZero do
            remotes: remotes
          }
        ) do
-    {ref, pid_groups} = pids_local[pid]
+    {mref, pid_groups} = pids_local[pid]
 
     new_pids_local =
       case pid_groups do
         [_] ->
-          Process.demonitor(ref)
+          Process.demonitor(mref)
           Map.delete(pids_local, pid)
 
         pid_groups ->
-          Map.put(pids_local, pid, {ref, List.delete(pid_groups, group)})
+          Map.put(pids_local, pid, {mref, List.delete(pid_groups, group)})
       end
 
     new_groups =
@@ -366,12 +428,12 @@ defmodule PGZero do
         {verb, pid, group},
         state = %ScopeState{scope_monitors: scope_monitors, group_monitors: group_monitors}
       ) do
-    for {ref, pid} <- scope_monitors do
-      send(pid, {ref, verb, pid, group})
+    for {ref, monitor_pid} <- scope_monitors do
+      send(monitor_pid, {ref, verb, pid, group})
     end
 
-    for {ref, pid} <- Map.get(group_monitors, group, %{}) do
-      send(pid, {ref, verb, pid, group})
+    for {ref, monitor_pid} <- Map.get(group_monitors, group, %{}) do
+      send(monitor_pid, {ref, verb, pid, group})
     end
   end
 
