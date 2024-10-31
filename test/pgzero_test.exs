@@ -204,6 +204,86 @@ defmodule PGZeroTest do
       assert [Group4] = :rpc.call(node_1, PGZero, :which_groups, [TestGroup15])
       assert [] = :rpc.call(node_1, PGZero, :which_local_groups, [TestGroup15])
     end
+
+    test "joining a cluster with a group that already exists" do
+      {:ok, cluster} = LocalCluster.start_link(3)
+      {:ok, [node_1, node_2, node_3] = nodes} = LocalCluster.nodes(cluster)
+
+      for node <- nodes do
+        :rpc.call(node, PGZero, :start, [[TestGroup18]])
+      end
+
+      for node <- nodes do
+        {:ok, pid} =
+          :rpc.call(
+            node,
+            IdleGenserver,
+            :start,
+            []
+          )
+
+        :ok =
+          :rpc.call(
+            node,
+            PGZero,
+            :join,
+            [pid, Group4, TestGroup18]
+          )
+      end
+
+      assert [_] = :rpc.call(node_1, PGZero, :members, [Group4, TestGroup18])
+      assert [_] = :rpc.call(node_2, PGZero, :members, [Group4, TestGroup18])
+      assert [_] = :rpc.call(node_3, PGZero, :members, [Group4, TestGroup18])
+
+      # By this point, none of the PGZero's has seen any :nodeup messages, so they are effectively unconnected.
+      # We send them by hand here to trigger the agents to see eachother.
+      for node <- nodes do
+        for node_2 <- nodes, node_2 != node do
+          send({TestGroup18, node}, {:nodeup, node_2})
+        end
+      end
+
+      Process.sleep(10)
+
+      assert [_, _, _] = :rpc.call(node_1, PGZero, :members, [Group4, TestGroup18])
+    end
+
+    test "knocking out a node causes its process group members to leave" do
+      {:ok, cluster} = LocalCluster.start_link(3)
+      {:ok, [node_1, _, node_3] = nodes} = LocalCluster.nodes(cluster)
+
+      for node <- nodes do
+        :rpc.call(node, PGZero, :start, [[TestGroup19]])
+      end
+
+      for node <- nodes do
+        # Workaround Alert: LocalCluster's startup does not shoot off :nodeup messages so we need to do that ourselves.
+        for node_2 <- nodes, node_2 != node do
+          send({TestGroup19, node}, {:nodeup, node_2})
+        end
+
+        # Workaround Alert
+        {:ok, pid} =
+          :rpc.call(
+            node,
+            IdleGenserver,
+            :start,
+            []
+          )
+
+        :ok =
+          :rpc.call(
+            node,
+            PGZero,
+            :join,
+            [pid, Group4, TestGroup19]
+          )
+      end
+
+      LocalCluster.stop(cluster, node_3)
+
+      assert [_, _] = :rpc.call(node_1, PGZero, :members, [Group4, TestGroup19])
+    end
   end
 
   describe "monitors!" do
