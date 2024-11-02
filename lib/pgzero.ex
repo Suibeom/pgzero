@@ -172,24 +172,28 @@ defmodule PGZero do
     {:reply, Map.get(groups_local, group, []), state}
   end
 
-  def handle_call(:monitor_scope, {pid, _}, state = %ScopeState{scope_monitors: scope_monitors}) do
+  def handle_call(
+        :monitor_scope,
+        {pid, _},
+        state = %ScopeState{groups: groups, scope_monitors: scope_monitors}
+      ) do
     mref = Process.monitor(pid)
-    {:reply, {:ok, mref}, %{state | scope_monitors: Map.put(scope_monitors, mref, pid)}}
+    {:reply, {mref, groups}, %{state | scope_monitors: Map.put(scope_monitors, mref, pid)}}
   end
 
   def handle_call(
         {:demonitor_scope, mref},
         {pid, _},
-        state = %ScopeState{scope_monitors: scope_monitors}
+        state = %ScopeState{groups: groups, scope_monitors: scope_monitors}
       ) do
     Process.demonitor(mref)
-    {:reply, {:ok, mref}, %{state | scope_monitors: Map.delete(scope_monitors, mref)}}
+    {:reply, {mref, groups}, %{state | scope_monitors: Map.delete(scope_monitors, mref)}}
   end
 
   def handle_call(
         {:monitor, group},
         {pid, _},
-        state = %ScopeState{group_monitors: group_monitors}
+        state = %ScopeState{groups: groups, group_monitors: group_monitors}
       ) do
     mref = Process.monitor(pid)
 
@@ -199,7 +203,7 @@ defmodule PGZero do
         map -> Map.update!(group_monitors, group, &Map.put(&1, mref, pid))
       end
 
-    {:reply, {:ok, mref}, %{state | group_monitors: new_group_monitors}}
+    {:reply, {mref, Map.get(groups, group, [])}, %{state | group_monitors: new_group_monitors}}
   end
 
   def handle_call(

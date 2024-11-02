@@ -298,6 +298,26 @@ defmodule PGZeroTest do
       assert_receive({_, :join, ^pid_1, Group2})
     end
 
+    test "On monitoring a scope, get a map of groups and existing group members" do
+      PGZero.start_link([TestScope20])
+      {:ok, pid_1} = IdleGenserver.start()
+
+      PGZero.join(pid_1, Group2, TestScope20)
+
+      assert({_, [pid_1]} = PGZero.monitor(Group2, TestScope20))
+    end
+
+    test "On monitoring a group, get the existing group members" do
+      PGZero.start_link([TestScope21])
+      {:ok, pid_1} = IdleGenserver.start()
+      {:ok, pid_2} = IdleGenserver.start()
+
+      PGZero.join(pid_1, Group2, TestScope21)
+      PGZero.join(pid_2, Group3, TestScope21)
+
+      assert({_, %{Group2 => [pid_1], Group3 => [pid_2]}} = PGZero.monitor_scope(TestScope21))
+    end
+
     test "monitors get leave messages from local leaves" do
       PGZero.start_link([TestScope7])
       {:ok, pid_1} = IdleGenserver.start()
@@ -315,7 +335,7 @@ defmodule PGZeroTest do
 
     test "group monitors are properly cleaned up on demonitor" do
       PGZero.start_link([TestScope9])
-      {:ok, mref} = PGZero.monitor(Group1, TestScope9)
+      {mref, _} = PGZero.monitor(Group1, TestScope9)
       PGZero.demonitor(mref, Group1, TestScope9)
 
       {:ok, pid_1} = IdleGenserver.start()
@@ -336,7 +356,7 @@ defmodule PGZeroTest do
 
     test "scope monitors are properly cleaned up on demonitor" do
       PGZero.start_link([TestScope11])
-      {:ok, mref} = PGZero.monitor_scope(TestScope11)
+      {mref, _} = PGZero.monitor_scope(TestScope11)
       PGZero.demonitor_scope(mref, TestScope11)
 
       {:ok, pid_1} = IdleGenserver.start()
@@ -373,7 +393,7 @@ defmodule PGZeroTest do
       end
 
       # Set up our process to monitor things.
-      {:ok, fws} = :rpc.call(node_1, ForwardGenserver, :start, [self()])
+      {:ok, _fws} = :rpc.call(node_1, ForwardGenserver, :start, [self()])
       :ok = :rpc.call(node_1, ForwardGenserver, :monitor, [Group1, TestScope8])
 
       {:ok, pid} =
